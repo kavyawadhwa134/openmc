@@ -1,0 +1,104 @@
+name: CORE-MATH cross-platform regression tests
+
+# Runs the regression tests of this branch on arm64 macOS and arm64 Linux with
+# the same build settings, to check whether the results are identical across
+# platforms (https://github.com/openmc-dev/openmc/issues/3820).
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  OMP_NUM_THREADS: 2
+
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    name: "Regression tests (${{ matrix.os }})"
+
+    steps:
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31'
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Environment Variables
+        run: |
+          echo "OPENMC_CROSS_SECTIONS=$HOME/nndc_hdf5/cross_sections.xml" >> $GITHUB_ENV
+          echo "OPENMC_ENDF_DATA=$HOME/endf-b-vii.1" >> $GITHUB_ENV
+          echo "$HOME/NJOY2016/build" >> $GITHUB_PATH
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install hdf5 libpng
+          echo "HDF5_ROOT=/opt/homebrew/opt/hdf5" >> $GITHUB_ENV
+          echo "FC=gfortran-15" >> $GITHUB_ENV
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt -y update
+          sudo apt install -y libhdf5-serial-dev libpng-dev gfortran
+
+      - name: Install NJOY
+        run: |
+          git clone -b 2016.78 https://github.com/njoy/NJOY2016 $HOME/NJOY2016
+          cmake -S $HOME/NJOY2016 -B $HOME/NJOY2016/build
+          cmake --build $HOME/NJOY2016/build --parallel 3
+
+      # Same settings as tools/ci/gha-install.py on this branch, without MPI,
+      # OpenMP or coverage
+      - name: Build OpenMC
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DOPENMC_USE_OPENMP=off \
+            -DHDF5_PREFER_PARALLEL=OFF
+          cmake --build build --parallel 3
+          sudo cmake --install build
+
+      - name: Install Python API
+        run: |
+          pip install --upgrade pip pytest numpy
+          pip install 'ncrystal>=4.1.0' mcpl
+          pip install -e .[test,vtk,ci]
+
+      - name: display-config
+        run: openmc -v
+
+      - name: cache-xs
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/nndc_hdf5
+            ~/endf-b-vii.1
+          key: ${{ runner.os }}-build-xs-cache-${{ hashFiles(format('{0}/tools/ci/download-xs.sh', github.workspace)) }}
+
+      - name: Download cross sections
+        run: tools/ci/download-xs.sh
+
+      - name: Regression tests
+        run: pytest -v -rfE tests/regression_tests
+
+      - name: Upload regression test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-results-${{ matrix.os }}
+          path: |
+            tests/regression_tests/**/results_test.dat
+            tests/regression_tests/**/results_error.dat
+          if-no-files-found: ignore
